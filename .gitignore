@@ -1,0 +1,21 @@
+# Environment variables (NEVER upload this)
+.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Trained models (large files)
+models/
+*.pkl
+
+# Local data
+data/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
