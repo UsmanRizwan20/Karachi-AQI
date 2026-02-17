@@ -1,6 +1,7 @@
 # Karachi-AQI
 This project is about predicting the AQI of Karachi for next 3 days using different ML models.
 A real-time Air Quality Index (AQI) monitoring and forecasting system for Karachi using historical data, OpenWeatherMap API, and machine learning models. This project generates synthetic historical features, trains multiple models, and provides live AQI predictions.
+The dashboard can be viewed by https://karachiaqibyusman.streamlit.app/. It shows the 3 days prediction using the best trained model.
 
 Features
 
