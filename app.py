@@ -1,5 +1,4 @@
 import os
-import json
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -29,30 +28,6 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-# ── AQI helpers ────────────────────────────────────────────────────────────────
-
-def pm25_to_us_aqi(pm25: float) -> float:
-    """
-    Convert PM2.5 concentration (μg/m³) to US AQI using EPA breakpoints.
-    Models now predict pm2_5 (continuous, high variance) instead of OWM's
-    1-5 integer index (which was always 2 for Karachi → constant predictions).
-    """
-    breakpoints = [
-        (0.0,   12.0,    0,   50),
-        (12.1,  35.4,   51,  100),
-        (35.5,  55.4,  101,  150),
-        (55.5, 150.4,  151,  200),
-        (150.5, 250.4, 201,  300),
-        (250.5, 350.4, 301,  400),
-        (350.5, 500.4, 401,  500),
-    ]
-    pm25 = max(0.0, min(500.4, pm25))
-    for c_lo, c_hi, i_lo, i_hi in breakpoints:
-        if c_lo <= pm25 <= c_hi:
-            return round((i_hi - i_lo) / (c_hi - c_lo) * (pm25 - c_lo) + i_lo, 1)
-    return 500.0
-
-
 def get_aqi_category(aqi):
     if aqi <= 50:    return "Good", "#00E400", "😊"
     elif aqi <= 100: return "Moderate", "#FFFF00", "😐"
@@ -61,8 +36,6 @@ def get_aqi_category(aqi):
     elif aqi <= 300: return "Very Unhealthy", "#8F3F97", "😨"
     else:            return "Hazardous", "#7E0023", "☠️"
 
-
-# ── Data fetching ──────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
 def fetch_current_aqi():
@@ -79,104 +52,30 @@ def fetch_current_aqi():
         c = aqi_r.json()['list'][0]['components']
         w = wx_r.json()
 
-        pm25 = c.get('pm2_5', 0)
         return {
-            'pm2_5':       pm25,
+            'aqi':         aqi_r.json()['list'][0]['main']['aqi'],
+            'pm2_5':       c.get('pm2_5', 0),
             'pm10':        c.get('pm10', 0),
             'no2':         c.get('no2', 0),
             'o3':          c.get('o3', 0),
             'so2':         c.get('so2', 0),
             'co':          c.get('co', 0),
-            'aqi_display': pm25_to_us_aqi(pm25),   # US AQI derived from live PM2.5
             'temperature': w['main']['temp'],
-            'feels_like':  w['main']['feels_like'],
-            'temp_min':    w['main']['temp_min'],
-            'temp_max':    w['main']['temp_max'],
             'humidity':    w['main']['humidity'],
             'wind_speed':  w['wind']['speed'],
-            'wind_deg':    w['wind'].get('deg', 0),
             'pressure':    w['main']['pressure'],
-            'clouds':      w.get('clouds', {}).get('all', 0),
         }
     except Exception as e:
         st.error(f"API Error: {e}")
         return None
 
 
-@st.cache_data(ttl=3600)
-def fetch_forecast_data():
-    """
-    Fetch real 5-day/3-hour weather + air pollution forecasts from OWM.
-    Returns one representative entry per day for the next 3 days.
-    Using real future API data (not synthetic offsets) ensures each day
-    gets genuinely different pollutant/weather inputs for the model.
-    """
-    try:
-        wx_r = requests.get("http://api.openweathermap.org/data/2.5/forecast",
-            params={'lat': KARACHI_LAT, 'lon': KARACHI_LON,
-                    'appid': OPENWEATHER_API_KEY, 'units': 'metric'}, timeout=10)
-        wx_r.raise_for_status()
-        wx_list = wx_r.json()['list']
-
-        aqi_r = requests.get("http://api.openweathermap.org/data/2.5/air_pollution/forecast",
-            params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY}, timeout=10)
-        aqi_r.raise_for_status()
-        aqi_list = aqi_r.json()['list']
-
-        today = datetime.now().date()
-        daily = {}
-        for entry in wx_list:
-            d = datetime.fromtimestamp(entry['dt']).date()
-            if d <= today:
-                continue
-            daily.setdefault(d, []).append(entry)
-
-        forecast_days = []
-        for i, (date, entries) in enumerate(sorted(daily.items())):
-            if i >= 3:
-                break
-            best = min(entries, key=lambda e: abs(datetime.fromtimestamp(e['dt']).hour - 12))
-            ts   = best['dt']
-            dt   = datetime.fromtimestamp(ts)
-            closest_aqi = min(aqi_list, key=lambda e: abs(e['dt'] - ts))
-            comp = closest_aqi['components']
-            pm25 = comp.get('pm2_5', 0)
-
-            forecast_days.append({
-                'date':        dt,
-                'pm2_5':       pm25,
-                'pm10':        comp.get('pm10', 0),
-                'no2':         comp.get('no2', 0),
-                'o3':          comp.get('o3', 0),
-                'so2':         comp.get('so2', 0),
-                'co':          comp.get('co', 0),
-                'aqi_display': pm25_to_us_aqi(pm25),  # OWM's own forecast AQI (fallback)
-                'temperature': best['main']['temp'],
-                'feels_like':  best['main']['feels_like'],
-                'temp_min':    best['main']['temp_min'],
-                'temp_max':    best['main']['temp_max'],
-                'humidity':    best['main']['humidity'],
-                'wind_speed':  best['wind']['speed'],
-                'wind_deg':    best['wind'].get('deg', 0),
-                'pressure':    best['main']['pressure'],
-                'clouds':      best.get('clouds', {}).get('all', 0),
-            })
-
-        return forecast_days
-
-    except Exception as e:
-        st.warning(f"Forecast API error: {e}")
-        return None
-
-
-# ── Model loading ──────────────────────────────────────────────────────────────
-
 @st.cache_resource
 def load_models():
     models = {}
     for name, path in [
-        ('Random Forest', MODEL_DIR / "random_forest_model.pkl"),
-        ('XGBoost',       MODEL_DIR / "xgboost_model.pkl"),
+        ('Random Forest',    MODEL_DIR / "random_forest_model.pkl"),
+        ('XGBoost',          MODEL_DIR / "xgboost_model.pkl"),
     ]:
         if path.exists():
             models[name] = joblib.load(path)
@@ -191,114 +90,101 @@ def load_models():
     return models
 
 
-@st.cache_data
-def load_feature_names():
-    path = MODEL_DIR / "feature_names.json"
-    if path.exists():
-        with open(path) as f:
-            return json.load(f)
-    return None
-
-
-# ── Prediction ─────────────────────────────────────────────────────────────────
-
-def build_feature_row(day_data: dict, feature_names: list) -> pd.DataFrame:
+def build_feature_row(data, day_offset=0):
     """
-    Build a feature row matching exactly the columns the model was trained on.
-    Uses real API data for each forecast day, so inputs differ meaningfully day-to-day.
+    Build a feature row from current API data.
+    Includes all features the model was trained on.
+    Day-over-day values are realistically shifted for multi-day forecasts.
     """
-    dt           = day_data['date']
-    hour         = dt.hour
-    day          = dt.day
-    month        = dt.month
-    day_of_week  = dt.weekday()
-    is_weekend   = int(day_of_week >= 5)
+    future_date = datetime.now() + timedelta(days=day_offset)
+
+    hour        = future_date.hour
+    day         = future_date.day
+    month       = future_date.month
+    day_of_week = future_date.weekday()       # 0=Monday, 6=Sunday
+    is_weekend  = int(day_of_week >= 5)
     is_rush_hour = int(hour in range(7, 10) or hour in range(17, 20))
-    season       = (month % 12) // 3
 
-    temperature = day_data['temperature']
-    feels_like  = day_data.get('feels_like', temperature - 2.0)
-    temp_min    = day_data.get('temp_min',   temperature - 3.0)
-    temp_max    = day_data.get('temp_max',   temperature + 3.0)
+    # Season: 0=winter, 1=spring, 2=summer, 3=fall
+    season = (month % 12) // 3
+
+    # Deterministic day-over-day trends (no randomness)
+    temp_trend     = day_offset * 0.3
+    humidity_trend = day_offset * 0.5
+
+    temperature = data['temperature'] + temp_trend
+    feels_like  = temperature - 2.0          # approximate feels_like
+    temp_min    = temperature - 3.0
+    temp_max    = temperature + 3.0
     temp_range  = temp_max - temp_min
+    humidity    = min(100, data['humidity'] + humidity_trend)
 
+    # Cyclical hour encoding
     hour_sin = np.sin(2 * np.pi * hour / 24)
     hour_cos = np.cos(2 * np.pi * hour / 24)
 
-    pm2_5    = day_data['pm2_5']
-    pm10     = day_data['pm10']
-    # feature_pipeline uses pm2_5 / (pm10 + 1) to avoid division by zero
-    pm_ratio = pm2_5 / (pm10 + 1)
+    pm2_5 = data['pm2_5']
+    pm10  = data['pm10']
+    pm_ratio = pm2_5 / pm10 if pm10 > 0 else 0.0
 
-    all_values = {
-        'hour':           hour,
-        'day':            day,
-        'month':          month,
-        'day_of_week':    day_of_week,
-        'is_weekend':     is_weekend,
-        'season':         season,
-        'pm2_5':          pm2_5,
-        'pm10':           pm10,
-        'no2':            day_data['no2'],
-        'o3':             day_data['o3'],
-        'so2':            day_data['so2'],
-        'co':             day_data['co'],
-        'temperature':    temperature,
-        'feels_like':     feels_like,
-        'temp_min':       temp_min,
-        'temp_max':       temp_max,
-        'pressure':       day_data['pressure'],
-        'humidity':       day_data['humidity'],
-        'wind_speed':     day_data['wind_speed'],
-        'wind_deg':       day_data.get('wind_deg', 0.0),
-        'clouds':         day_data.get('clouds', 0.0),
-        'pm_ratio':       pm_ratio,
-        'temp_range':     temp_range,
-        'is_rush_hour':   is_rush_hour,
-        'hour_sin':       hour_sin,
-        'hour_cos':       hour_cos,
-        'aqi_change_rate': 0.0,   # unknown at inference time; use neutral value
+    row = {
+        'hour':        hour,
+        'day':         day,
+        'month':       month,
+        'day_of_week': day_of_week,
+        'is_weekend':  is_weekend,
+        'season':      season,
+        'pm2_5':       pm2_5,
+        'pm10':        pm10,
+        'no2':         data['no2'],
+        'o3':          data['o3'],
+        'so2':         data['so2'],
+        'co':          data['co'],
+        'temperature': temperature,
+        'feels_like':  feels_like,
+        'temp_min':    temp_min,
+        'temp_max':    temp_max,
+        'pressure':    data['pressure'],
+        'humidity':    humidity,
+        'wind_speed':  data['wind_speed'],
+        'wind_deg':    0.0,   # not available from API, use neutral default
+        'clouds':      0.0,   # not available from API, use neutral default
+        'pm_ratio':    pm_ratio,
+        'temp_range':  temp_range,
+        'is_rush_hour': is_rush_hour,
+        'hour_sin':    hour_sin,
+        'hour_cos':    hour_cos,
     }
-
-    # Select only the features the model was actually trained on, in the right order
-    row = {k: all_values[k] for k in feature_names if k in all_values}
-    return pd.DataFrame([row])[feature_names]
+    return pd.DataFrame([row])
 
 
-def predict_pm25(model_obj, feature_df) -> float:
-    """
-    Run prediction. Models now predict PM2.5 (μg/m³), not OWM's 1-5 index.
-    Caller converts the result to US AQI via pm25_to_us_aqi().
-    """
+def predict_with_model(model_obj, feature_df):
+    """Run prediction handling both plain models and NN (which needs a scaler)."""
     if isinstance(model_obj, dict):
+        # Neural Network with scaler
         scaled = model_obj['scaler'].transform(feature_df)
-        raw    = float(model_obj['model'].predict(scaled)[0])
+        return float(model_obj['model'].predict(scaled)[0])
     else:
-        raw = float(model_obj.predict(feature_df)[0])
-    return max(0.0, raw)   # PM2.5 can't be negative
+        return float(model_obj.predict(feature_df)[0])
 
 
-def make_forecast(forecast_days, model_obj, feature_names):
+def make_forecast(data, model_obj, days=3):
+    """Generate a 3-day forecast using the actual trained ML model."""
     preds = []
-    for day_data in forecast_days:
-        feature_df = build_feature_row(day_data, feature_names)
+    for i in range(1, days + 1):
+        feature_df = build_feature_row(data, day_offset=i)
         try:
-            predicted_pm25 = predict_pm25(model_obj, feature_df)
-            predicted_aqi  = pm25_to_us_aqi(predicted_pm25)
+            predicted_aqi = predict_with_model(model_obj, feature_df)
+            predicted_aqi = round(max(0.0, min(500.0, predicted_aqi)), 1)
         except Exception as e:
-            st.warning(f"Prediction error for {day_data['date'].strftime('%A')}: {e}")
-            # Fall back to OWM's own forecast converted to US AQI
-            predicted_aqi  = day_data['aqi_display']
-            predicted_pm25 = day_data['pm2_5']
+            st.warning(f"Prediction error on day {i}: {e}")
+            predicted_aqi = data["aqi"] * 50
         preds.append({
-            'date':        day_data['date'],
-            'pm2_5':       round(predicted_pm25, 1),
-            'aqi_display': predicted_aqi,
+            'date': datetime.now() + timedelta(days=i),
+            'aqi':  predicted_aqi
         })
     return preds
 
-
-# ── Main app ───────────────────────────────────────────────────────────────────
 
 def main():
     st.title(f"🌍 {CITY_NAME} Air Quality Index Predictor")
@@ -312,18 +198,21 @@ def main():
 
         if models:
             best_model_file = MODEL_DIR / "best_model.txt"
+
             if best_model_file.exists():
                 with open(best_model_file, "r") as f:
                     best_model_name = f.read().strip()
-                model_choice = best_model_name if best_model_name in models else list(models.keys())[0]
                 if best_model_name in models:
+                    model_choice = best_model_name
                     st.success(f"🏆 Best Model Auto-Selected: {model_choice}")
                 else:
+                    model_choice = list(models.keys())[0]
                     st.warning("Best model not found — using first available.")
             else:
                 model_choice = list(models.keys())[0]
                 st.warning("best_model.txt not found — using first available model.")
 
+            # Let user manually override model choice
             model_choice = st.selectbox("Choose Model", list(models.keys()),
                                         index=list(models.keys()).index(model_choice))
         else:
@@ -346,69 +235,55 @@ def main():
             st.cache_data.clear()
             st.rerun()
 
-    with st.spinner("Fetching live AQI data..."):
+    with st.spinner("Fetching live AQI data for Karachi..."):
         data = fetch_current_aqi()
 
     if not data:
         st.error("Cannot fetch data. Check OPENWEATHERMAP_API_KEY in .env file.")
         return
 
-    # ── Current AQI ────────────────────────────────────────────────────────────
     st.header("📊 Current Air Quality")
 
-    aqi_display = data['aqi_display']
+    aqi_raw     = data['aqi']
+    aqi_display = round(aqi_raw * 50, 1)
     cat, color, emoji = get_aqi_category(aqi_display)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("AQI (US Scale)", f"{aqi_display:.0f}")
-    c2.metric("PM2.5",          f"{data['pm2_5']:.1f} μg/m³")
-    c3.metric("Temperature",    f"{data['temperature']:.1f}°C")
-    c4.metric("Humidity",       f"{data['humidity']:.0f}%")
+    c1.metric("AQI Index",    aqi_raw)
+    c2.metric("PM2.5",        f"{data['pm2_5']:.1f} μg/m³")
+    c3.metric("Temperature",  f"{data['temperature']:.1f}°C")
+    c4.metric("Humidity",     f"{data['humidity']:.0f}%")
 
     st.markdown(f"""
     <div style='padding:1rem; background:{color}; color:black; border-radius:8px; margin:1rem 0;'>
         <h3>{emoji} Air Quality: {cat}</h3>
-        <p>Current AQI for {CITY_NAME} is {aqi_display:.0f} — {cat}</p>
+        <p>Current AQI for Karachi is {aqi_raw} — {cat}</p>
     </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
 
-    # ── 3-Day Forecast ──────────────────────────────────────────────────────────
     st.header("📅 3-Day AQI Forecast")
 
-    feature_names = load_feature_names()
-    if not feature_names:
-        st.error("feature_names.json not found. Please re-run training_pipeline.py.")
-        return
-
-    with st.spinner("Fetching forecast data..."):
-        forecast_days = fetch_forecast_data()
-
-    if not forecast_days:
-        st.warning("Could not fetch forecast data from OpenWeatherMap. Try refreshing.")
-        return
-
     if model_choice and models:
-        st.info(f"🤖 Predictions by: **{model_choice}** — predicting PM2.5 → converted to US AQI")
-        preds = make_forecast(forecast_days, models[model_choice], feature_names)
+        st.info(f"🤖 Predictions generated by: **{model_choice}**")
+        preds = make_forecast(data, models[model_choice])
     else:
         st.warning("No model available for forecast.")
         return
 
-    cols = st.columns(3)
+    cols  = st.columns(3)
     for i, pred in enumerate(preds):
         with cols[i]:
             st.subheader(pred['date'].strftime("%A"))
-            st.metric(pred['date'].strftime("%b %d"), f"AQI {pred['aqi_display']:.0f}")
-            st.caption(f"PM2.5: {pred['pm2_5']} μg/m³")
-            cat2, _, em2 = get_aqi_category(pred["aqi_display"])
+            st.metric(pred['date'].strftime("%b %d"), f"AQI {pred['aqi']}")
+            cat2, _, em2 = get_aqi_category(pred["aqi"])
             st.markdown(f"{em2} **{cat2}**")
 
     st.markdown("---")
     st.subheader("📈 AQI Trend")
 
     dates  = ['Today'] + [p['date'].strftime("%a") for p in preds]
-    values = [aqi_display] + [p['aqi_display'] for p in preds]
+    values = [aqi_display] + [p['aqi'] for p in preds]
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -418,8 +293,8 @@ def main():
         marker=dict(size=12)
     ))
     fig.update_layout(
-        title=f'AQI Forecast - {CITY_NAME}',
-        xaxis_title='Day', yaxis_title='AQI (US Scale)',
+        title='AQI Forecast - Karachi',
+        xaxis_title='Day', yaxis_title='AQI',
         height=400,
         plot_bgcolor='#1A1F2E', paper_bgcolor='#1A1F2E',
         font=dict(color='white')
@@ -453,11 +328,11 @@ def main():
     else:                    st.error("☠️ HAZARDOUS! Avoid all outdoor activities!")
 
     st.markdown("---")
-    st.markdown(f"""
+    st.markdown("""
     <div style='text-align:center; color:#888; padding:2rem;'>
         <p>🤖 Models: Random Forest | XGBoost | Neural Network (MLP)</p>
         <p>📡 Live data: OpenWeatherMap API | 🗄️ Feature Store: Hopsworks</p>
-        <p>🌍 {CITY_NAME} AQI Predictor — Serverless ML Pipeline</p>
+        <p>🌍 Karachi AQI Predictor — Serverless ML Pipeline</p>
     </div>""", unsafe_allow_html=True)
 
 
