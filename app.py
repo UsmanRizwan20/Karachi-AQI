@@ -37,6 +37,15 @@ def get_aqi_category(aqi):
     else:            return "Hazardous", "#7E0023", "☠️"
 
 
+def owm_aqi_to_us_aqi(owm_aqi) -> float:
+    """
+    Convert OpenWeatherMap's 1-5 AQI index to a US-style 0-500 AQI scale.
+    OWM: 1=Good, 2=Fair, 3=Moderate, 4=Poor, 5=Very Poor
+    """
+    mapping = {1: 25, 2: 75, 3: 125, 4: 175, 5: 300}
+    return float(mapping.get(int(round(max(1, min(5, owm_aqi)))), 75))
+
+
 @st.cache_data(ttl=3600)
 def fetch_current_aqi():
     try:
@@ -51,9 +60,11 @@ def fetch_current_aqi():
 
         c = aqi_r.json()['list'][0]['components']
         w = wx_r.json()
+        owm_aqi_raw = aqi_r.json()['list'][0]['main']['aqi']
 
         return {
-            'aqi':         aqi_r.json()['list'][0]['main']['aqi'],
+            'aqi':         owm_aqi_raw,                     # 1-5 OWM scale (model input)
+            'aqi_display': owm_aqi_to_us_aqi(owm_aqi_raw), # 0-500 US scale (display)
             'pm2_5':       c.get('pm2_5', 0),
             'pm10':        c.get('pm10', 0),
             'no2':         c.get('no2', 0),
@@ -63,10 +74,81 @@ def fetch_current_aqi():
             'temperature': w['main']['temp'],
             'humidity':    w['main']['humidity'],
             'wind_speed':  w['wind']['speed'],
+            'wind_deg':    w['wind'].get('deg', 0),
             'pressure':    w['main']['pressure'],
+            'clouds':      w.get('clouds', {}).get('all', 0),
         }
     except Exception as e:
         st.error(f"API Error: {e}")
+        return None
+
+
+@st.cache_data(ttl=3600)
+def fetch_forecast_data():
+    """
+    Fetch real 5-day/3-hour weather forecast + air pollution forecast from OWM.
+    Returns one representative data point per day for the next 3 days.
+    This gives the model genuinely different pollutant/weather inputs for each day.
+    """
+    try:
+        # 5-day / 3-hour weather forecast
+        wx_r = requests.get("http://api.openweathermap.org/data/2.5/forecast",
+            params={'lat': KARACHI_LAT, 'lon': KARACHI_LON,
+                    'appid': OPENWEATHER_API_KEY, 'units': 'metric'}, timeout=10)
+        wx_r.raise_for_status()
+        wx_list = wx_r.json()['list']
+
+        # Air pollution forecast
+        aqi_r = requests.get("http://api.openweathermap.org/data/2.5/air_pollution/forecast",
+            params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY}, timeout=10)
+        aqi_r.raise_for_status()
+        aqi_list = aqi_r.json()['list']
+
+        # Group weather entries by date, skip today
+        today = datetime.now().date()
+        daily = {}
+        for entry in wx_list:
+            d = datetime.fromtimestamp(entry['dt']).date()
+            if d <= today:
+                continue
+            daily.setdefault(d, []).append(entry)
+
+        forecast_days = []
+        for i, (date, entries) in enumerate(sorted(daily.items())):
+            if i >= 3:
+                break
+            # Pick entry closest to noon for a representative daytime reading
+            best = min(entries, key=lambda e: abs(datetime.fromtimestamp(e['dt']).hour - 12))
+            ts   = best['dt']
+            dt   = datetime.fromtimestamp(ts)
+
+            # Match closest pollution entry by timestamp
+            closest_aqi = min(aqi_list, key=lambda e: abs(e['dt'] - ts))
+            comp        = closest_aqi['components']
+            owm_aqi_raw = closest_aqi['main']['aqi']
+
+            forecast_days.append({
+                'date':        dt,
+                'aqi':         owm_aqi_raw,
+                'aqi_display': owm_aqi_to_us_aqi(owm_aqi_raw),
+                'pm2_5':       comp.get('pm2_5', 0),
+                'pm10':        comp.get('pm10', 0),
+                'no2':         comp.get('no2', 0),
+                'o3':          comp.get('o3', 0),
+                'so2':         comp.get('so2', 0),
+                'co':          comp.get('co', 0),
+                'temperature': best['main']['temp'],
+                'humidity':    best['main']['humidity'],
+                'wind_speed':  best['wind']['speed'],
+                'wind_deg':    best['wind'].get('deg', 0),
+                'pressure':    best['main']['pressure'],
+                'clouds':      best.get('clouds', {}).get('all', 0),
+            })
+
+        return forecast_days
+
+    except Exception as e:
+        st.warning(f"Forecast API error: {e}")
         return None
 
 
@@ -74,8 +156,8 @@ def fetch_current_aqi():
 def load_models():
     models = {}
     for name, path in [
-        ('Random Forest',    MODEL_DIR / "random_forest_model.pkl"),
-        ('XGBoost',          MODEL_DIR / "xgboost_model.pkl"),
+        ('Random Forest', MODEL_DIR / "random_forest_model.pkl"),
+        ('XGBoost',       MODEL_DIR / "xgboost_model.pkl"),
     ]:
         if path.exists():
             models[name] = joblib.load(path)
@@ -90,110 +172,97 @@ def load_models():
     return models
 
 
-def build_feature_row(data, day_offset=0):
+def build_feature_row(day_data: dict) -> pd.DataFrame:
     """
-    Build a feature row from current API data.
-    Includes all features the model was trained on.
-    Day-over-day values are realistically shifted for multi-day forecasts.
+    Build a feature row from a real forecast day dict.
+    All pollutant/weather values come from the actual OWM API for that future date,
+    so each day gets genuinely different inputs — no synthetic offsets needed.
     """
-    future_date = datetime.now() + timedelta(days=day_offset)
-
-    hour        = future_date.hour
-    day         = future_date.day
-    month       = future_date.month
-    day_of_week = future_date.weekday()       # 0=Monday, 6=Sunday
-    is_weekend  = int(day_of_week >= 5)
+    dt           = day_data['date']
+    hour         = dt.hour
+    day          = dt.day
+    month        = dt.month
+    day_of_week  = dt.weekday()
+    is_weekend   = int(day_of_week >= 5)
     is_rush_hour = int(hour in range(7, 10) or hour in range(17, 20))
+    season       = (month % 12) // 3
 
-    # Season: 0=winter, 1=spring, 2=summer, 3=fall
-    season = (month % 12) // 3
-
-    # Deterministic day-over-day trends (no randomness)
-    temp_trend     = day_offset * 0.3
-    humidity_trend = day_offset * 0.5
-
-    temperature = data['temperature'] + temp_trend
-    feels_like  = temperature - 2.0          # approximate feels_like
+    temperature = day_data['temperature']
+    feels_like  = temperature - 2.0
     temp_min    = temperature - 3.0
     temp_max    = temperature + 3.0
     temp_range  = temp_max - temp_min
-    humidity    = min(100, data['humidity'] + humidity_trend)
 
-    # Cyclical hour encoding
     hour_sin = np.sin(2 * np.pi * hour / 24)
     hour_cos = np.cos(2 * np.pi * hour / 24)
 
-    # Apply deterministic day-over-day drift to pollutants.
-    # Without this, the model receives identical features every day
-    # and produces the same AQI prediction for all 3 days.
-    # We use a simple sinusoidal decay pattern to simulate natural
-    # pollutant dispersion/accumulation trends.
-    pollutant_factor = 1.0 + (day_offset * 0.05 * np.sin(day_offset * np.pi / 3))
-    wind_trend = data['wind_speed'] + day_offset * 0.1  # slight wind increase disperses pollutants
-
-    pm2_5 = max(0.0, data['pm2_5'] * pollutant_factor)
-    pm10  = max(0.0, data['pm10']  * pollutant_factor)
-    no2   = max(0.0, data['no2']   * pollutant_factor)
-    o3    = max(0.0, data['o3']    * (1.0 + day_offset * 0.03))  # O3 has its own trend
-    so2   = max(0.0, data['so2']   * pollutant_factor)
-    co    = max(0.0, data['co']    * pollutant_factor)
+    pm2_5    = day_data['pm2_5']
+    pm10     = day_data['pm10']
     pm_ratio = pm2_5 / pm10 if pm10 > 0 else 0.0
 
     row = {
-        'hour':        hour,
-        'day':         day,
-        'month':       month,
-        'day_of_week': day_of_week,
-        'is_weekend':  is_weekend,
-        'season':      season,
-        'pm2_5':       pm2_5,
-        'pm10':        pm10,
-        'no2':         no2,
-        'o3':          o3,
-        'so2':         so2,
-        'co':          co,
-        'temperature': temperature,
-        'feels_like':  feels_like,
-        'temp_min':    temp_min,
-        'temp_max':    temp_max,
-        'pressure':    data['pressure'],
-        'humidity':    humidity,
-        'wind_speed':  wind_trend,
-        'wind_deg':    0.0,   # not available from API, use neutral default
-        'clouds':      0.0,   # not available from API, use neutral default
-        'pm_ratio':    pm_ratio,
-        'temp_range':  temp_range,
+        'hour':         hour,
+        'day':          day,
+        'month':        month,
+        'day_of_week':  day_of_week,
+        'is_weekend':   is_weekend,
+        'season':       season,
+        'pm2_5':        pm2_5,
+        'pm10':         pm10,
+        'no2':          day_data['no2'],
+        'o3':           day_data['o3'],
+        'so2':          day_data['so2'],
+        'co':           day_data['co'],
+        'temperature':  temperature,
+        'feels_like':   feels_like,
+        'temp_min':     temp_min,
+        'temp_max':     temp_max,
+        'pressure':     day_data['pressure'],
+        'humidity':     day_data['humidity'],
+        'wind_speed':   day_data['wind_speed'],
+        'wind_deg':     day_data.get('wind_deg', 0.0),
+        'clouds':       day_data.get('clouds', 0.0),
+        'pm_ratio':     pm_ratio,
+        'temp_range':   temp_range,
         'is_rush_hour': is_rush_hour,
-        'hour_sin':    hour_sin,
-        'hour_cos':    hour_cos,
+        'hour_sin':     hour_sin,
+        'hour_cos':     hour_cos,
     }
     return pd.DataFrame([row])
 
 
-def predict_with_model(model_obj, feature_df):
-    """Run prediction handling both plain models and NN (which needs a scaler)."""
+def predict_with_model(model_obj, feature_df) -> float:
+    """Run prediction handling both plain models and NN (which needs a scaler).
+    The models were trained on OWM's 1-5 AQI index as target, so we convert
+    the raw output to the US 0-500 scale for display consistency.
+    """
     if isinstance(model_obj, dict):
-        # Neural Network with scaler
         scaled = model_obj['scaler'].transform(feature_df)
-        return float(model_obj['model'].predict(scaled)[0])
+        raw    = float(model_obj['model'].predict(scaled)[0])
     else:
-        return float(model_obj.predict(feature_df)[0])
+        raw = float(model_obj.predict(feature_df)[0])
+
+    # Clamp to 1-5 range then convert to US AQI scale
+    return owm_aqi_to_us_aqi(raw)
 
 
-def make_forecast(data, model_obj, days=3):
-    """Generate a 3-day forecast using the actual trained ML model."""
+def make_forecast(forecast_days, model_obj):
+    """
+    Generate a 3-day forecast using real OWM forecast data + the trained ML model.
+    Each day gets genuine future weather/pollution inputs so predictions can differ.
+    """
     preds = []
-    for i in range(1, days + 1):
-        feature_df = build_feature_row(data, day_offset=i)
+    for day_data in forecast_days:
+        feature_df = build_feature_row(day_data)
         try:
             predicted_aqi = predict_with_model(model_obj, feature_df)
-            predicted_aqi = round(max(0.0, min(500.0, predicted_aqi)), 1)
         except Exception as e:
-            st.warning(f"Prediction error on day {i}: {e}")
-            predicted_aqi = data["aqi"] * 50
+            st.warning(f"Prediction error for {day_data['date'].strftime('%A')}: {e}")
+            # Fall back to raw OWM forecast AQI if model fails
+            predicted_aqi = day_data['aqi_display']
         preds.append({
-            'date': datetime.now() + timedelta(days=i),
-            'aqi':  predicted_aqi
+            'date':        day_data['date'],
+            'aqi_display': predicted_aqi,
         })
     return preds
 
@@ -224,7 +293,6 @@ def main():
                 model_choice = list(models.keys())[0]
                 st.warning("best_model.txt not found — using first available model.")
 
-            # Let user manually override model choice
             model_choice = st.selectbox("Choose Model", list(models.keys()),
                                         index=list(models.keys()).index(model_choice))
         else:
@@ -247,55 +315,63 @@ def main():
             st.cache_data.clear()
             st.rerun()
 
-    with st.spinner("Fetching live AQI data for Karachi..."):
+    with st.spinner("Fetching live AQI data..."):
         data = fetch_current_aqi()
 
     if not data:
         st.error("Cannot fetch data. Check OPENWEATHERMAP_API_KEY in .env file.")
         return
 
+    # ── Current AQI ──────────────────────────────────────────────────────────
     st.header("📊 Current Air Quality")
 
-    aqi_raw     = data['aqi']
-    aqi_display = round(aqi_raw * 50, 1)
+    aqi_display = data['aqi_display']
     cat, color, emoji = get_aqi_category(aqi_display)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("AQI Index",    aqi_raw)
-    c2.metric("PM2.5",        f"{data['pm2_5']:.1f} μg/m³")
-    c3.metric("Temperature",  f"{data['temperature']:.1f}°C")
-    c4.metric("Humidity",     f"{data['humidity']:.0f}%")
+    c1.metric("AQI (US Scale)", f"{aqi_display:.0f}")
+    c2.metric("PM2.5",          f"{data['pm2_5']:.1f} μg/m³")
+    c3.metric("Temperature",    f"{data['temperature']:.1f}°C")
+    c4.metric("Humidity",       f"{data['humidity']:.0f}%")
 
     st.markdown(f"""
     <div style='padding:1rem; background:{color}; color:black; border-radius:8px; margin:1rem 0;'>
         <h3>{emoji} Air Quality: {cat}</h3>
-        <p>Current AQI for Karachi is {aqi_raw} — {cat}</p>
+        <p>Current AQI for {CITY_NAME} is {aqi_display:.0f} — {cat}</p>
     </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
 
+    # ── 3-Day Forecast ───────────────────────────────────────────────────────
     st.header("📅 3-Day AQI Forecast")
 
+    with st.spinner("Fetching forecast data..."):
+        forecast_days = fetch_forecast_data()
+
+    if not forecast_days:
+        st.warning("Could not fetch forecast data from OpenWeatherMap. Try refreshing.")
+        return
+
     if model_choice and models:
-        st.info(f"🤖 Predictions generated by: **{model_choice}**")
-        preds = make_forecast(data, models[model_choice])
+        st.info(f"🤖 Predictions generated by: **{model_choice}** using real OWM forecast data")
+        preds = make_forecast(forecast_days, models[model_choice])
     else:
         st.warning("No model available for forecast.")
         return
 
-    cols  = st.columns(3)
+    cols = st.columns(3)
     for i, pred in enumerate(preds):
         with cols[i]:
             st.subheader(pred['date'].strftime("%A"))
-            st.metric(pred['date'].strftime("%b %d"), f"AQI {pred['aqi']}")
-            cat2, _, em2 = get_aqi_category(pred["aqi"])
+            st.metric(pred['date'].strftime("%b %d"), f"AQI {pred['aqi_display']:.0f}")
+            cat2, _, em2 = get_aqi_category(pred["aqi_display"])
             st.markdown(f"{em2} **{cat2}**")
 
     st.markdown("---")
     st.subheader("📈 AQI Trend")
 
     dates  = ['Today'] + [p['date'].strftime("%a") for p in preds]
-    values = [aqi_display] + [p['aqi'] for p in preds]
+    values = [aqi_display] + [p['aqi_display'] for p in preds]
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -305,8 +381,8 @@ def main():
         marker=dict(size=12)
     ))
     fig.update_layout(
-        title='AQI Forecast - Karachi',
-        xaxis_title='Day', yaxis_title='AQI',
+        title=f'AQI Forecast - {CITY_NAME}',
+        xaxis_title='Day', yaxis_title='AQI (US Scale)',
         height=400,
         plot_bgcolor='#1A1F2E', paper_bgcolor='#1A1F2E',
         font=dict(color='white')
@@ -340,11 +416,11 @@ def main():
     else:                    st.error("☠️ HAZARDOUS! Avoid all outdoor activities!")
 
     st.markdown("---")
-    st.markdown("""
+    st.markdown(f"""
     <div style='text-align:center; color:#888; padding:2rem;'>
         <p>🤖 Models: Random Forest | XGBoost | Neural Network (MLP)</p>
         <p>📡 Live data: OpenWeatherMap API | 🗄️ Feature Store: Hopsworks</p>
-        <p>🌍 Karachi AQI Predictor — Serverless ML Pipeline</p>
+        <p>🌍 {CITY_NAME} AQI Predictor — Serverless ML Pipeline</p>
     </div>""", unsafe_allow_html=True)
 
 
