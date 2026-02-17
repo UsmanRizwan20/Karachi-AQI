@@ -70,6 +70,71 @@ def fetch_current_aqi():
         return None
 
 
+# ── NEW: fetch real pollutant + weather forecast per day ──────────────────────
+@st.cache_data(ttl=3600)
+def fetch_aqi_forecast():
+    """
+    Fetch real 4-day pollutant forecast from OpenWeatherMap.
+    Returns a dict keyed by date → averaged pollutant + weather values.
+    Falls back to an empty dict if the API call fails.
+    """
+    try:
+        # Air-pollution forecast (hourly, up to 4 days ahead)
+        poll_r = requests.get(
+            "http://api.openweathermap.org/data/2.5/air_pollution/forecast",
+            params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY},
+            timeout=10
+        )
+        poll_r.raise_for_status()
+
+        # Weather forecast (3-hour steps, up to 5 days ahead)
+        wx_r = requests.get(
+            "http://api.openweathermap.org/data/2.5/forecast",
+            params={'lat': KARACHI_LAT, 'lon': KARACHI_LON,
+                    'appid': OPENWEATHER_API_KEY, 'units': 'metric'},
+            timeout=10
+        )
+        wx_r.raise_for_status()
+
+        # ── Group pollutant readings by date and collect values ──
+        poll_daily = {}
+        for item in poll_r.json()['list']:
+            date = datetime.fromtimestamp(item['dt']).date()
+            c = item['components']
+            if date not in poll_daily:
+                poll_daily[date] = {k: [] for k in ('pm2_5', 'pm10', 'no2', 'o3', 'so2', 'co')}
+            for key in poll_daily[date]:
+                poll_daily[date][key].append(c.get(key, 0))
+
+        # ── Group weather readings by date and collect values ──
+        wx_daily = {}
+        for item in wx_r.json()['list']:
+            date = datetime.fromtimestamp(item['dt']).date()
+            if date not in wx_daily:
+                wx_daily[date] = {k: [] for k in ('temperature', 'humidity', 'wind_speed', 'pressure')}
+            wx_daily[date]['temperature'].append(item['main']['temp'])
+            wx_daily[date]['humidity'].append(item['main']['humidity'])
+            wx_daily[date]['wind_speed'].append(item['wind']['speed'])
+            wx_daily[date]['pressure'].append(item['main']['pressure'])
+
+        # ── Build per-day averages ──
+        result = {}
+        for date, vals in poll_daily.items():
+            wx = wx_daily.get(date, {})
+            result[date] = {k: float(np.mean(v)) for k, v in vals.items()}
+            result[date]['temperature'] = float(np.mean(wx.get('temperature', [25])))
+            result[date]['humidity']    = float(np.mean(wx.get('humidity',    [60])))
+            result[date]['wind_speed']  = float(np.mean(wx.get('wind_speed',  [3])))
+            result[date]['pressure']    = float(np.mean(wx.get('pressure',    [1010])))
+
+        return result
+
+    except Exception as e:
+        st.warning(f"Forecast API error (falling back to today's data): {e}")
+        return {}
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 @st.cache_resource
 def load_models():
     models = {}
@@ -92,68 +157,66 @@ def load_models():
 
 def build_feature_row(data, day_offset=0):
     """
-    Build a feature row from current API data.
-    Includes all features the model was trained on.
-    Day-over-day values are realistically shifted for multi-day forecasts.
+    Build a feature row from pollutant/weather data for a given day.
+    `data` should already contain the correct values for that specific day
+    (real forecast data when available, today's data as fallback).
     """
     future_date = datetime.now() + timedelta(days=day_offset)
 
-    hour        = future_date.hour
-    day         = future_date.day
-    month       = future_date.month
-    day_of_week = future_date.weekday()       # 0=Monday, 6=Sunday
-    is_weekend  = int(day_of_week >= 5)
+    hour         = future_date.hour
+    day          = future_date.day
+    month        = future_date.month
+    day_of_week  = future_date.weekday()        # 0=Monday, 6=Sunday
+    is_weekend   = int(day_of_week >= 5)
     is_rush_hour = int(hour in range(7, 10) or hour in range(17, 20))
 
     # Season: 0=winter, 1=spring, 2=summer, 3=fall
     season = (month % 12) // 3
 
-    # Deterministic day-over-day trends (no randomness)
-    temp_trend     = day_offset * 0.3
-    humidity_trend = day_offset * 0.5
-
-    temperature = data['temperature'] + temp_trend
-    feels_like  = temperature - 2.0          # approximate feels_like
+    # Use the values directly from data — no manual trend shifting needed
+    # because fetch_aqi_forecast() already provides real future values.
+    temperature = data['temperature']
+    feels_like  = temperature - 2.0    # approximate feels_like
     temp_min    = temperature - 3.0
     temp_max    = temperature + 3.0
     temp_range  = temp_max - temp_min
-    humidity    = min(100, data['humidity'] + humidity_trend)
+    humidity    = min(100, data['humidity'])
 
     # Cyclical hour encoding
     hour_sin = np.sin(2 * np.pi * hour / 24)
     hour_cos = np.cos(2 * np.pi * hour / 24)
 
-    pm2_5 = data['pm2_5']
-    pm10  = data['pm10']
+    pm2_5    = data['pm2_5']
+    pm10     = data['pm10']
     pm_ratio = pm2_5 / pm10 if pm10 > 0 else 0.0
 
     row = {
-        'hour':        hour,
-        'day':         day,
-        'month':       month,
-        'day_of_week': day_of_week,
-        'is_weekend':  is_weekend,
-        'season':      season,
-        'pm2_5':       pm2_5,
-        'pm10':        pm10,
-        'no2':         data['no2'],
-        'o3':          data['o3'],
-        'so2':         data['so2'],
-        'co':          data['co'],
-        'temperature': temperature,
-        'feels_like':  feels_like,
-        'temp_min':    temp_min,
-        'temp_max':    temp_max,
-        'pressure':    data['pressure'],
-        'humidity':    humidity,
-        'wind_speed':  data['wind_speed'],
-        'wind_deg':    0.0,   # not available from API, use neutral default
-        'clouds':      0.0,   # not available from API, use neutral default
-        'pm_ratio':    pm_ratio,
-        'temp_range':  temp_range,
+        'hour':         hour,
+        'day':          day,
+        'month':        month,
+        'day_of_week':  day_of_week,
+        'is_weekend':   is_weekend,
+        'season':       season,
+        'pm2_5':        pm2_5,
+        'pm10':         pm10,
+        'no2':          data['no2'],
+        'o3':           data['o3'],
+        'so2':          data['so2'],
+        'co':           data['co'],
+        'temperature':  temperature,
+        'feels_like':   feels_like,
+        'temp_min':     temp_min,
+        'temp_max':     temp_max,
+        'pressure':     data['pressure'],
+        'humidity':     humidity,
+        'wind_speed':   data['wind_speed'],
+        'wind_deg':     0.0,   # not available from API, use neutral default
+        'clouds':       0.0,   # not available from API, use neutral default
+        'pm_ratio':     pm_ratio,
+        'temp_range':   temp_range,
         'is_rush_hour': is_rush_hour,
-        'hour_sin':    hour_sin,
-        'hour_cos':    hour_cos,
+        'hour_sin':     hour_sin,
+        'hour_cos':     hour_cos,
     }
     return pd.DataFrame([row])
 
@@ -161,29 +224,43 @@ def build_feature_row(data, day_offset=0):
 def predict_with_model(model_obj, feature_df):
     """Run prediction handling both plain models and NN (which needs a scaler)."""
     if isinstance(model_obj, dict):
-        # Neural Network with scaler
         scaled = model_obj['scaler'].transform(feature_df)
         return float(model_obj['model'].predict(scaled)[0])
     else:
         return float(model_obj.predict(feature_df)[0])
 
 
+# ── UPDATED: make_forecast now uses real forecast data per day ────────────────
 def make_forecast(data, model_obj, days=3):
-    """Generate a 3-day forecast using the actual trained ML model."""
+    """
+    Generate a 3-day forecast using real pollutant forecast data from
+    OpenWeatherMap's /air_pollution/forecast endpoint.
+    Falls back to today's data for any day where forecast is unavailable.
+    """
+    forecast_data = fetch_aqi_forecast()   # dict: date → pollutant + weather values
     preds = []
+
     for i in range(1, days + 1):
-        feature_df = build_feature_row(data, day_offset=i)
+        future_date = (datetime.now() + timedelta(days=i)).date()
+
+        # Use real forecast data if available, otherwise fall back to today's data
+        day_data = forecast_data.get(future_date, data)
+
+        feature_df = build_feature_row(day_data, day_offset=i)
         try:
             predicted_aqi = predict_with_model(model_obj, feature_df)
             predicted_aqi = round(max(0.0, min(500.0, predicted_aqi)), 1)
         except Exception as e:
             st.warning(f"Prediction error on day {i}: {e}")
             predicted_aqi = data["aqi"] * 50
+
         preds.append({
             'date': datetime.now() + timedelta(days=i),
             'aqi':  predicted_aqi
         })
+
     return preds
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def main():
