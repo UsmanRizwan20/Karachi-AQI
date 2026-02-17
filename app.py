@@ -175,10 +175,10 @@ def make_forecast(data, model_obj, days=3):
         feature_df = build_feature_row(data, day_offset=i)
         try:
             predicted_aqi = predict_with_model(model_obj, feature_df)
-            predicted_aqi = round(max(1.0, min(5.0, predicted_aqi)), 2)
+            predicted_aqi = round(max(0.0, min(500.0, predicted_aqi)), 1)
         except Exception as e:
             st.warning(f"Prediction error on day {i}: {e}")
-            predicted_aqi = data['aqi']
+            predicted_aqi = data["aqi"] * 50
         preds.append({
             'date': datetime.now() + timedelta(days=i),
             'aqi':  predicted_aqi
@@ -245,7 +245,7 @@ def main():
     st.header("📊 Current Air Quality")
 
     aqi_raw     = data['aqi']
-    aqi_display = aqi_raw * 50
+    aqi_display = round(aqi_raw * 50, 1)
     cat, color, emoji = get_aqi_category(aqi_display)
 
     c1, c2, c3, c4 = st.columns(4)
@@ -276,14 +276,14 @@ def main():
         with cols[i]:
             st.subheader(pred['date'].strftime("%A"))
             st.metric(pred['date'].strftime("%b %d"), f"AQI {pred['aqi']}")
-            cat2, _, em2 = get_aqi_category(pred['aqi'] * 50)
+            cat2, _, em2 = get_aqi_category(pred["aqi"])
             st.markdown(f"{em2} **{cat2}**")
 
     st.markdown("---")
     st.subheader("📈 AQI Trend")
 
     dates  = ['Today'] + [p['date'].strftime("%a") for p in preds]
-    values = [aqi_raw]  + [p['aqi'] for p in preds]
+    values = [aqi_display] + [p['aqi'] for p in preds]
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
