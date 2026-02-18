@@ -37,6 +37,24 @@ def get_aqi_category(aqi):
     else:            return "Hazardous", "#7E0023", "☠️"
 
 
+def pm25_to_us_aqi(pm25: float) -> float:
+    """Convert PM2.5 (μg/m³) to US AQI using EPA breakpoint formula."""
+    breakpoints = [
+        (0.0,   12.0,    0,   50),
+        (12.1,  35.4,   51,  100),
+        (35.5,  55.4,  101,  150),
+        (55.5, 150.4,  151,  200),
+        (150.5, 250.4, 201,  300),
+        (250.5, 350.4, 301,  400),
+        (350.5, 500.4, 401,  500),
+    ]
+    pm25 = max(0.0, min(500.4, pm25))
+    for c_lo, c_hi, i_lo, i_hi in breakpoints:
+        if c_lo <= pm25 <= c_hi:
+            return round((i_hi - i_lo) / (c_hi - c_lo) * (pm25 - c_lo) + i_lo, 1)
+    return 500.0
+
+
 @st.cache_data(ttl=3600)
 def fetch_current_aqi():
     try:
@@ -103,24 +121,46 @@ def build_feature_row(data, day_offset=0):
     # Season: 0=winter, 1=spring, 2=summer, 3=fall
     season = (month % 12) // 3
 
-    # Deterministic day-over-day trends (no randomness)
+    # --- Day-over-day meteorological trends ---
     temp_trend     = day_offset * 0.3
     humidity_trend = day_offset * 0.5
 
     temperature = data['temperature'] + temp_trend
-    feels_like  = temperature - 2.0          # approximate feels_like
+    feels_like  = temperature - 2.0
     temp_min    = temperature - 3.0
     temp_max    = temperature + 3.0
     temp_range  = temp_max - temp_min
     humidity    = min(100, data['humidity'] + humidity_trend)
 
+    # Wind slightly picks up each day (common in Karachi sea breeze patterns)
+    wind_speed = data['wind_speed'] + day_offset * 0.4
+
+    # Pressure dips slightly each day (typical weather system progression)
+    pressure = data['pressure'] - day_offset * 0.8
+
+    # --- Pollutant decay / build-up model ---
+    # Higher wind = better dispersion → pollutants decrease.
+    # Higher humidity = hygroscopic growth → PM increases slightly.
+    # Simple physical approximation: each day the baseline shifts based on
+    # wind dispersion and humidity effects.
+    wind_dispersion_factor = max(0.5, 1.0 - (wind_speed - data['wind_speed']) * 0.05)
+    humidity_factor        = 1.0 + (humidity - data['humidity']) * 0.003
+
+    # Mean-reversion: pollutants tend to drift toward a seasonal baseline
+    # Use a decay constant so Day 1 ≠ Day 2 ≠ Day 3
+    decay = wind_dispersion_factor * humidity_factor
+    pm2_5 = max(1.0, data['pm2_5'] * (decay ** day_offset))
+    pm10  = max(1.0, data['pm10']  * (decay ** day_offset))
+    no2   = max(0.0, data['no2']   * (decay ** day_offset))
+    o3    = max(0.0, data['o3']    + day_offset * 1.5)   # O3 builds with sunlight
+    so2   = max(0.0, data['so2']   * (decay ** day_offset))
+    co    = max(0.0, data['co']    * (decay ** day_offset))
+
+    pm_ratio = pm2_5 / pm10 if pm10 > 0 else 0.0
+
     # Cyclical hour encoding
     hour_sin = np.sin(2 * np.pi * hour / 24)
     hour_cos = np.cos(2 * np.pi * hour / 24)
-
-    pm2_5 = data['pm2_5']
-    pm10  = data['pm10']
-    pm_ratio = pm2_5 / pm10 if pm10 > 0 else 0.0
 
     row = {
         'hour':        hour,
@@ -131,17 +171,17 @@ def build_feature_row(data, day_offset=0):
         'season':      season,
         'pm2_5':       pm2_5,
         'pm10':        pm10,
-        'no2':         data['no2'],
-        'o3':          data['o3'],
-        'so2':         data['so2'],
-        'co':          data['co'],
+        'no2':         no2,
+        'o3':          o3,
+        'so2':         so2,
+        'co':          co,
         'temperature': temperature,
         'feels_like':  feels_like,
         'temp_min':    temp_min,
         'temp_max':    temp_max,
-        'pressure':    data['pressure'],
+        'pressure':    pressure,
         'humidity':    humidity,
-        'wind_speed':  data['wind_speed'],
+        'wind_speed':  wind_speed,
         'wind_deg':    0.0,   # not available from API, use neutral default
         'clouds':      0.0,   # not available from API, use neutral default
         'pm_ratio':    pm_ratio,
@@ -154,13 +194,14 @@ def build_feature_row(data, day_offset=0):
 
 
 def predict_with_model(model_obj, feature_df):
-    """Run prediction handling both plain models and NN (which needs a scaler)."""
+    """Run prediction handling both plain models and NN (which needs a scaler).
+    Models predict PM2.5 (μg/m³) — we convert to US AQI before returning."""
     if isinstance(model_obj, dict):
-        # Neural Network with scaler
         scaled = model_obj['scaler'].transform(feature_df)
-        return float(model_obj['model'].predict(scaled)[0])
+        pm25 = float(model_obj['model'].predict(scaled)[0])
     else:
-        return float(model_obj.predict(feature_df)[0])
+        pm25 = float(model_obj.predict(feature_df)[0])
+    return pm25_to_us_aqi(pm25)
 
 
 def make_forecast(data, model_obj, days=3):
@@ -173,7 +214,7 @@ def make_forecast(data, model_obj, days=3):
             predicted_aqi = round(max(0.0, min(500.0, predicted_aqi)), 1)
         except Exception as e:
             st.warning(f"Prediction error on day {i}: {e}")
-            predicted_aqi = data["aqi"] * 50
+            predicted_aqi = pm25_to_us_aqi(data['pm2_5'])  # safe fallback
         preds.append({
             'date': datetime.now() + timedelta(days=i),
             'aqi':  predicted_aqi
@@ -239,12 +280,12 @@ def main():
 
     st.header("📊 Current Air Quality")
 
-    aqi_raw     = data['aqi']
-    aqi_display = round(aqi_raw * 50, 1)
+    # Convert today's PM2.5 to proper US AQI using the same EPA formula as the forecast
+    aqi_display = pm25_to_us_aqi(data['pm2_5'])
     cat, color, emoji = get_aqi_category(aqi_display)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("AQI Index",    aqi_raw)
+    c1.metric("AQI (US)",     f"{aqi_display:.0f}")
     c2.metric("PM2.5",        f"{data['pm2_5']:.1f} μg/m³")
     c3.metric("Temperature",  f"{data['temperature']:.1f}°C")
     c4.metric("Humidity",     f"{data['humidity']:.0f}%")
@@ -252,7 +293,7 @@ def main():
     st.markdown(f"""
     <div style='padding:1rem; background:{color}; color:black; border-radius:8px; margin:1rem 0;'>
         <h3>{emoji} Air Quality: {cat}</h3>
-        <p>Current AQI for Karachi is {aqi_raw} — {cat}</p>
+        <p>Current AQI for Karachi is {aqi_display:.0f} — {cat}</p>
     </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
