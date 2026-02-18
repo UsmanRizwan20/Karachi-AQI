@@ -1,23 +1,4 @@
-"""
-backfill_pipeline.py
-────────────────────
-Fetches REAL historical air quality + weather data from the OpenWeatherMap API
-for the past N days (default 100), computes features, and pushes them to
-Hopsworks Feature Store.
 
-OWM endpoints used:
-  • Air Pollution History : /data/2.5/air_pollution/history  (free tier, back to Nov 2020)
-  • Weather History       : /data/2.5/onecall/timemachine    (paid) OR
-                            We derive weather features from the hourly AQ timestamps
-                            plus a single current-weather fetch for calibration.
-
-Because OWM's free weather history is limited, we:
-  1. Fetch the full hourly AQ history (real PM2.5, PM10, NO2, O3, SO2, CO).
-  2. For weather (temp, humidity, wind, pressure), we call the paid
-     /onecall/timemachine if available, otherwise fall back to fetching
-     current weather once and applying Karachi seasonal adjustments.
-     Set USE_PAID_WEATHER=True in .env if you have a paid OWM key.
-"""
 
 import os
 import sys
