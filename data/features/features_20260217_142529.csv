@@ -1,0 +1,2 @@
+timestamp,hour,day,month,day_of_week,is_weekend,season,pm2_5,pm10,no2,o3,so2,co,aqi,temperature,feels_like,temp_min,temp_max,pressure,humidity,wind_speed,wind_deg,clouds,pm_ratio,temp_range,is_rush_hour,hour_sin,hour_cos
+2026-02-17 14:25:29,14,17,2,1,0,1,20.86,34.62,0.03,85.85,0.12,131.71,2,23.07,23,23.07,23.07,1011,60,10.29,310,100,0.5856260527793374,0.0,0,-0.4999999999999997,-0.8660254037844388
