@@ -191,3 +191,4 @@ if __name__ == "__main__":
 
     df = generate_historical_features(365)
     save_to_hopsworks(df)
+
