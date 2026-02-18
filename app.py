@@ -45,7 +45,7 @@ def fetch_current_aqi():
             params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY}, timeout=10)
         aqi_r.raise_for_status()
 
-        # Fetch forecast air pollution
+        # Fetch forecast air pollution (CRITICAL FIX: This gets future data)
         forecast_r = requests.get("http://api.openweathermap.org/data/2.5/air_pollution/forecast",
             params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY}, timeout=10)
         forecast_r.raise_for_status()
@@ -179,20 +179,34 @@ def predict_with_model(model_obj, feature_df):
 def make_forecast(data, model_obj, days=3):
     preds = []
     forecast_list = data.get('forecast_list', [])
+    
+    # Debug: Check if forecast list is empty
+    if not forecast_list:
+        st.warning("Forecast data is empty. Using current values for all days.")
+
     for i in range(1, days + 1):
-        idx = min((i * 24) - 1, len(forecast_list) - 1)
+        # Target index: approx 24h, 48h, 72h from now
+        # We target the index closest to 'i' days ahead (i * 24 hours)
+        target_idx = (i * 24) - 1
         overrides = None
-        if forecast_list and idx >= 0:
-            forecast_item = forecast_list[idx]
-            components = forecast_item['components']
-            overrides = {
-                'pm2_5': components.get('pm2_5', 0),
-                'pm10':  components.get('pm10', 0),
-                'no2':   components.get('no2', 0),
-                'o3':    components.get('o3', 0),
-                'so2':   components.get('so2', 0),
-                'co':    components.get('co', 0),
-            }
+        
+        # Safely get forecast item
+        if forecast_list:
+            # Use min to ensure we don't go out of bounds if list is short
+            safe_idx = min(target_idx, len(forecast_list) - 1)
+            
+            # Ensure index is non-negative
+            if safe_idx >= 0:
+                forecast_item = forecast_list[safe_idx]
+                components = forecast_item['components']
+                overrides = {
+                    'pm2_5': components.get('pm2_5', 0),
+                    'pm10':  components.get('pm10', 0),
+                    'no2':   components.get('no2', 0),
+                    'o3':    components.get('o3', 0),
+                    'so2':   components.get('so2', 0),
+                    'co':    components.get('co', 0),
+                }
 
         feature_df = build_feature_row(data, day_offset=i, pollutant_overrides=overrides)
         try:
