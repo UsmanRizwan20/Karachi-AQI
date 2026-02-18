@@ -91,11 +91,7 @@ def load_models():
 
 
 def build_feature_row(data, day_offset=0):
-    """
-    Build a feature row from current API data.
-    Includes all features the model was trained on.
-    Day-over-day values are realistically shifted for multi-day forecasts.
-    """
+   
     future_date = datetime.now() + timedelta(days=day_offset)
 
     hour        = future_date.hour
@@ -123,9 +119,16 @@ def build_feature_row(data, day_offset=0):
     hour_sin = np.sin(2 * np.pi * hour / 24)
     hour_cos = np.cos(2 * np.pi * hour / 24)
 
-    pm2_5 = data['pm2_5']
-    pm10  = data['pm10']
-    pm_ratio = pm2_5 / pm10 if pm10 > 0 else 0.0
+   pollution_trend = day_offset * 1.5
+
+pm2_5 = data['pm2_5'] + pollution_trend
+pm10  = data['pm10'] + pollution_trend
+no2   = data['no2'] + pollution_trend
+o3    = data['o3'] + pollution_trend
+so2   = data['so2'] + pollution_trend
+co    = data['co'] + (pollution_trend * 10)
+
+pm_ratio = pm2_5 / pm10 if pm10 > 0 else 0.0
 
     row = {
         'hour':        hour,
@@ -136,10 +139,11 @@ def build_feature_row(data, day_offset=0):
         'season':      season,
         'pm2_5':       pm2_5,
         'pm10':        pm10,
-        'no2':         data['no2'],
-        'o3':          data['o3'],
-        'so2':         data['so2'],
-        'co':          data['co'],
+        'no2':         no2,
+'o3':          o3,
+'so2':         so2,
+'co':          co,
+
         'temperature': temperature,
         'feels_like':  feels_like,
         'temp_min':    temp_min,
