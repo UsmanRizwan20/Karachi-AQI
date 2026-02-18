@@ -1,4 +1,3 @@
-
 import os
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -44,7 +43,9 @@ def fetch_current_aqi():
         aqi_r = requests.get("http://api.openweathermap.org/data/2.5/air_pollution",
             params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY}, timeout=10)
         aqi_r.raise_for_status()
-
+        forecast_r = requests.get("http://api.openweathermap.org/data/2.5/air_pollution/forecast",
+            params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY}, timeout=10)
+        forecast_r.raise_for_status()
         wx_r = requests.get("http://api.openweathermap.org/data/2.5/weather",
             params={'lat': KARACHI_LAT, 'lon': KARACHI_LON,
                     'appid': OPENWEATHER_API_KEY, 'units': 'metric'}, timeout=10)
@@ -65,6 +66,7 @@ def fetch_current_aqi():
             'humidity':    w['main']['humidity'],
             'wind_speed':  w['wind']['speed'],
             'pressure':    w['main']['pressure'],
+            'forecast_list': forecast_r.json()['list']
         }
     except Exception as e:
         st.error(f"API Error: {e}")
@@ -91,41 +93,43 @@ def load_models():
     return models
 
 
-def build_feature_row(data, day_offset=0):
-    """
-    Build a feature row from current API data.
-    Includes all features the model was trained on.
-    Day-over-day values are realistically shifted for multi-day forecasts.
-    """
+def build_feature_row(data, day_offset=0, pollutant_overrides=None):
     future_date = datetime.now() + timedelta(days=day_offset)
-
     hour        = future_date.hour
     day         = future_date.day
     month       = future_date.month
-    day_of_week = future_date.weekday()       # 0=Monday, 6=Sunday
+    day_of_week = future_date.weekday()
     is_weekend  = int(day_of_week >= 5)
     is_rush_hour = int(hour in range(7, 10) or hour in range(17, 20))
-
-    # Season: 0=winter, 1=spring, 2=summer, 3=fall
     season = (month % 12) // 3
 
-    # Deterministic day-over-day trends (no randomness)
+    if pollutant_overrides:
+        pm2_5 = pollutant_overrides.get('pm2_5', data['pm2_5'])
+        pm10  = pollutant_overrides.get('pm10', data['pm10'])
+        no2   = pollutant_overrides.get('no2', data['no2'])
+        o3    = pollutant_overrides.get('o3', data['o3'])
+        so2   = pollutant_overrides.get('so2', data['so2'])
+        co    = pollutant_overrides.get('co', data['co'])
+    else:
+        pm2_5 = data['pm2_5']
+        pm10  = data['pm10']
+        no2   = data['no2']
+        o3    = data['o3']
+        so2   = data['so2']
+        co    = data['co']
+
     temp_trend     = day_offset * 0.3
     humidity_trend = day_offset * 0.5
 
     temperature = data['temperature'] + temp_trend
-    feels_like  = temperature - 2.0          # approximate feels_like
+    feels_like  = temperature - 2.0
     temp_min    = temperature - 3.0
     temp_max    = temperature + 3.0
     temp_range  = temp_max - temp_min
     humidity    = min(100, data['humidity'] + humidity_trend)
 
-    # Cyclical hour encoding
     hour_sin = np.sin(2 * np.pi * hour / 24)
     hour_cos = np.cos(2 * np.pi * hour / 24)
-
-    pm2_5 = data['pm2_5']
-    pm10  = data['pm10']
     pm_ratio = pm2_5 / pm10 if pm10 > 0 else 0.0
 
     row = {
@@ -137,10 +141,10 @@ def build_feature_row(data, day_offset=0):
         'season':      season,
         'pm2_5':       pm2_5,
         'pm10':        pm10,
-        'no2':         data['no2'],
-        'o3':          data['o3'],
-        'so2':         data['so2'],
-        'co':          data['co'],
+        'no2':         no2,
+        'o3':          o3,
+        'so2':         so2,
+        'co':          co,
         'temperature': temperature,
         'feels_like':  feels_like,
         'temp_min':    temp_min,
@@ -148,8 +152,8 @@ def build_feature_row(data, day_offset=0):
         'pressure':    data['pressure'],
         'humidity':    humidity,
         'wind_speed':  data['wind_speed'],
-        'wind_deg':    0.0,   # not available from API, use neutral default
-        'clouds':      0.0,   # not available from API, use neutral default
+        'wind_deg':    0.0,
+        'clouds':      0.0,
         'pm_ratio':    pm_ratio,
         'temp_range':  temp_range,
         'is_rush_hour': is_rush_hour,
@@ -160,9 +164,7 @@ def build_feature_row(data, day_offset=0):
 
 
 def predict_with_model(model_obj, feature_df):
-    """Run prediction handling both plain models and NN (which needs a scaler)."""
     if isinstance(model_obj, dict):
-        # Neural Network with scaler
         scaled = model_obj['scaler'].transform(feature_df)
         return float(model_obj['model'].predict(scaled)[0])
     else:
@@ -170,16 +172,31 @@ def predict_with_model(model_obj, feature_df):
 
 
 def make_forecast(data, model_obj, days=3):
-    """Generate a 3-day forecast using the actual trained ML model."""
     preds = []
+    forecast_list = data.get('forecast_list', [])
     for i in range(1, days + 1):
-        feature_df = build_feature_row(data, day_offset=i)
+        idx = min((i * 24) - 1, len(forecast_list) - 1)
+        overrides = None
+        if forecast_list and idx >= 0:
+            forecast_item = forecast_list[idx]
+            components = forecast_item['components']
+            overrides = {
+                'pm2_5': components.get('pm2_5', 0),
+                'pm10':  components.get('pm10', 0),
+                'no2':   components.get('no2', 0),
+                'o3':    components.get('o3', 0),
+                'so2':   components.get('so2', 0),
+                'co':    components.get('co', 0),
+            }
+
+        feature_df = build_feature_row(data, day_offset=i, pollutant_overrides=overrides)
         try:
             predicted_aqi = predict_with_model(model_obj, feature_df)
             predicted_aqi = round(max(0.0, min(500.0, predicted_aqi)), 1)
         except Exception as e:
             st.warning(f"Prediction error on day {i}: {e}")
             predicted_aqi = data["aqi"] * 50
+            
         preds.append({
             'date': datetime.now() + timedelta(days=i),
             'aqi':  predicted_aqi
@@ -213,7 +230,6 @@ def main():
                 model_choice = list(models.keys())[0]
                 st.warning("best_model.txt not found — using first available model.")
 
-            # Let user manually override model choice
             model_choice = st.selectbox("Choose Model", list(models.keys()),
                                         index=list(models.keys()).index(model_choice))
         else:
