@@ -40,12 +40,17 @@ def get_aqi_category(aqi):
 @st.cache_data(ttl=3600)
 def fetch_current_aqi():
     try:
+        # Fetch current air pollution
         aqi_r = requests.get("http://api.openweathermap.org/data/2.5/air_pollution",
             params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY}, timeout=10)
         aqi_r.raise_for_status()
+
+        # Fetch forecast air pollution
         forecast_r = requests.get("http://api.openweathermap.org/data/2.5/air_pollution/forecast",
             params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY}, timeout=10)
         forecast_r.raise_for_status()
+
+        # Fetch current weather
         wx_r = requests.get("http://api.openweathermap.org/data/2.5/weather",
             params={'lat': KARACHI_LAT, 'lon': KARACHI_LON,
                     'appid': OPENWEATHER_API_KEY, 'units': 'metric'}, timeout=10)
