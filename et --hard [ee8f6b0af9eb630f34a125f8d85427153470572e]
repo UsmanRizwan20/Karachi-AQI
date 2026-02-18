@@ -1,0 +1,31 @@
+[33mfc962e1[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m Merge branch 'main' of https://github.com/UsmanRizwan20/Karachi-AQI
+[33mee8f6b0[m Update models with correct feature columns
+[33mabe9963[m Update app.py
+[33m864367f[m Update app.py
+[33m3ee2293[m Update app.py
+[33m435f026[m Update app.py
+[33m05e5d73[m Update app.py
+[33m0683e22[m Update app.py
+[33m9cd97f2[m Update app.py
+[33m6668242[m Update app.py
+[33mca3acd8[m Update app.py
+[33m9f6caca[m Update app.py
+[33m41c3735[m Update app.py
+[33m6410fa5[m Update app.py
+[33mb422284[m Update app.py
+[33maccbfea[m Update training_pipeline.py
+[33m6e89e91[m Update app.py
+[33mcecacf5[m Update app.py
+[33m3685afc[m Update README.md
+[33md2a0229[m Add files via upload
+[33m60a60b8[m Update app.py
+[33m0471055[m Update backfill_pipeline.py
+[33mb0768ed[m Update app.py
+[33mbe04a59[m Update app.py
+[33ma10387c[m Add trained model files
+[33m8d7adc4[m Added Dev Container Folder
+[33m06af18f[m Update .gitignore
+[33me10b5c3[m Initial commit: AQI prediction pipeline
+[33m632ce5b[m Update README.md
+[33me74d514[m Update README.md
+[33mb8a3c43[m Initial commit

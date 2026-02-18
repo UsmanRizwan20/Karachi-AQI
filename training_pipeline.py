@@ -25,9 +25,16 @@ FEATURE_GROUP_VERSION = int(os.getenv("FEATURE_GROUP_VERSION", "1"))
 MODEL_DIR = Path("models")
 MODEL_DIR.mkdir(exist_ok=True)
 
-
+# ── Target variable change ─────────────────────────────────────────────────────
+# OLD: TARGET_COL = 'aqi'  ← OWM's 1-5 integer index
+#      This was always 2 for Karachi, so all models learned a constant function.
+#
+# NEW: TARGET_COL = 'pm2_5'
+#      PM2.5 is a continuous variable (e.g. 10–200 μg/m³) with real daily variance.
+#      After predicting pm2_5, we convert to US AQI using the EPA breakpoint formula.
+#      This gives meaningful, varying 3-day forecasts.
 TARGET_COL   = 'pm2_5'
-EXCLUDE_COLS = ['timestamp', 'aqi', 'pm2_5']   
+EXCLUDE_COLS = ['timestamp', 'aqi', 'pm2_5']   # exclude target + OWM raw aqi from features
 
 
 def pm25_to_us_aqi(pm25: float) -> float:

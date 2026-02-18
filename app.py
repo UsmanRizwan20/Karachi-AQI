@@ -1,5 +1,4 @@
 import os
-import json
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -38,45 +37,27 @@ def get_aqi_category(aqi):
     else:            return "Hazardous", "#7E0023", "☠️"
 
 
-def pm25_to_us_aqi(pm25: float) -> float:
-    """Convert PM2.5 concentration (μg/m³) to US AQI using EPA breakpoints."""
-    breakpoints = [
-        (0.0,   12.0,    0,   50),
-        (12.1,  35.4,   51,  100),
-        (35.5,  55.4,  101,  150),
-        (55.5, 150.4,  151,  200),
-        (150.5, 250.4, 201,  300),
-        (250.5, 350.4, 301,  400),
-        (350.5, 500.4, 401,  500),
-    ]
-    pm25 = max(0.0, min(500.4, pm25))
-    for c_lo, c_hi, i_lo, i_hi in breakpoints:
-        if c_lo <= pm25 <= c_hi:
-            return round((i_hi - i_lo) / (c_hi - c_lo) * (pm25 - c_lo) + i_lo, 1)
-    return 500.0
-
-
 @st.cache_data(ttl=3600)
 def fetch_current_aqi():
     try:
+        # Fetch current air pollution
         aqi_r = requests.get("http://api.openweathermap.org/data/2.5/air_pollution",
             params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY}, timeout=10)
         aqi_r.raise_for_status()
 
+        # Fetch forecast air pollution
+        forecast_r = requests.get("http://api.openweathermap.org/data/2.5/air_pollution/forecast",
+            params={'lat': KARACHI_LAT, 'lon': KARACHI_LON, 'appid': OPENWEATHER_API_KEY}, timeout=10)
+        forecast_r.raise_for_status()
+
+        # Fetch current weather
         wx_r = requests.get("http://api.openweathermap.org/data/2.5/weather",
             params={'lat': KARACHI_LAT, 'lon': KARACHI_LON,
                     'appid': OPENWEATHER_API_KEY, 'units': 'metric'}, timeout=10)
         wx_r.raise_for_status()
 
-        # Fetch 5-day forecast to get realistic daily weather per day
-        fc_r = requests.get("http://api.openweathermap.org/data/2.5/forecast",
-            params={'lat': KARACHI_LAT, 'lon': KARACHI_LON,
-                    'appid': OPENWEATHER_API_KEY, 'units': 'metric', 'cnt': 40}, timeout=10)
-        fc_r.raise_for_status()
-
         c = aqi_r.json()['list'][0]['components']
         w = wx_r.json()
-        forecast_list = fc_r.json().get('list', [])
 
         return {
             'aqi':         aqi_r.json()['list'][0]['main']['aqi'],
@@ -89,10 +70,8 @@ def fetch_current_aqi():
             'temperature': w['main']['temp'],
             'humidity':    w['main']['humidity'],
             'wind_speed':  w['wind']['speed'],
-            'wind_deg':    w['wind'].get('deg', 0),
             'pressure':    w['main']['pressure'],
-            'clouds':      w['clouds']['all'],
-            'forecast':    forecast_list,
+            'forecast_list': forecast_r.json()['list']
         }
     except Exception as e:
         st.error(f"API Error: {e}")
@@ -119,145 +98,89 @@ def load_models():
     return models
 
 
-@st.cache_data
-def load_feature_names():
-    fn_path = MODEL_DIR / "feature_names.json"
-    if fn_path.exists():
-        with open(fn_path) as f:
-            return json.load(f)
-    return None
+def build_feature_row(data, day_offset=0, pollutant_overrides=None):
+    future_date = datetime.now() + timedelta(days=day_offset)
+    hour        = future_date.hour
+    day         = future_date.day
+    month       = future_date.month
+    day_of_week = future_date.weekday()
+    is_weekend  = int(day_of_week >= 5)
+    is_rush_hour = int(hour in range(7, 10) or hour in range(17, 20))
+    season = (month % 12) // 3
 
-
-def get_forecast_weather_for_day(forecast_list, day_offset):
-    """Extract representative noon weather for a given day offset from OWM forecast."""
-    target_date = (datetime.now() + timedelta(days=day_offset)).date()
-    day_entries = [
-        e for e in forecast_list
-        if datetime.fromtimestamp(e['dt']).date() == target_date
-    ]
-    if not day_entries:
-        return None
-    noon_entries = [e for e in day_entries if datetime.fromtimestamp(e['dt']).hour == 12]
-    entry = noon_entries[0] if noon_entries else day_entries[len(day_entries) // 2]
-    temp_vals = [e['main']['temp'] for e in day_entries]
-    return {
-        'temperature': entry['main']['temp'],
-        'feels_like':  entry['main']['feels_like'],
-        'temp_min':    min(temp_vals),
-        'temp_max':    max(temp_vals),
-        'pressure':    entry['main']['pressure'],
-        'humidity':    entry['main']['humidity'],
-        'wind_speed':  entry['wind']['speed'],
-        'wind_deg':    entry['wind'].get('deg', 0),
-        'clouds':      entry['clouds']['all'],
-    }
-
-
-def build_feature_row(data, day_offset, prev_pm25=None):
-    """
-    Build one feature row for the model at `day_offset` days ahead.
-    Each day gets DIFFERENT pollutant and weather values so predictions vary.
-    """
-    future_date  = datetime.now() + timedelta(days=day_offset)
-    feature_names = load_feature_names()
-
-    hour         = 12   # predict for midday
-    day          = future_date.day
-    month        = future_date.month
-    day_of_week  = future_date.weekday()
-    is_weekend   = int(day_of_week >= 5)
-    is_rush_hour = 0
-    season       = (month % 12) // 3
-    hour_sin     = np.sin(2 * np.pi * hour / 24)
-    hour_cos     = np.cos(2 * np.pi * hour / 24)
-
-    # ── PM2.5: mean-reversion to seasonal baseline ────────────────────────────
-    SEASONAL_BASELINE_PM25 = {
-        1: 55, 2: 50, 3: 45, 4: 40, 5: 38, 6: 35,
-        7: 33, 8: 33, 9: 38, 10: 45, 11: 52, 12: 58
-    }
-    pm25_baseline   = SEASONAL_BASELINE_PM25.get(month, 45)
-    base_pm25       = prev_pm25 if prev_pm25 is not None else data['pm2_5']
-    pm2_5           = base_pm25 + 0.15 * (pm25_baseline - base_pm25)
-
-    pm10_ratio = (data['pm10'] / data['pm2_5']) if data['pm2_5'] > 0 else 1.65
-    pm10_ratio = max(1.0, min(3.0, pm10_ratio))
-    pm10 = pm2_5 * pm10_ratio
-
-    decay = 0.95 ** day_offset
-    no2 = data['no2'] * decay
-    o3  = data['o3']  * (0.97 ** day_offset)
-    so2 = data['so2'] * decay
-    co  = data['co']  * decay
-
-    pm_ratio        = pm2_5 / pm10 if pm10 > 0 else 0.0
-    aqi_change_rate = pm2_5 - base_pm25
-
-    # ── Weather: use OWM 5-day forecast ───────────────────────────────────────
-    wx = get_forecast_weather_for_day(data.get('forecast', []), day_offset)
-    if wx:
-        temperature = wx['temperature']
-        feels_like  = wx['feels_like']
-        temp_min    = wx['temp_min']
-        temp_max    = wx['temp_max']
-        pressure    = wx['pressure']
-        humidity    = wx['humidity']
-        wind_speed  = wx['wind_speed']
-        wind_deg    = wx['wind_deg']
-        clouds      = wx['clouds']
+    if pollutant_overrides:
+        pm2_5 = pollutant_overrides.get('pm2_5', data['pm2_5'])
+        pm10  = pollutant_overrides.get('pm10', data['pm10'])
+        no2   = pollutant_overrides.get('no2', data['no2'])
+        o3    = pollutant_overrides.get('o3', data['o3'])
+        so2   = pollutant_overrides.get('so2', data['so2'])
+        co    = pollutant_overrides.get('co', data['co'])
     else:
-        temperature = data['temperature'] + day_offset * 0.3
-        feels_like  = temperature - 2.0
-        temp_min    = temperature - 3.0
-        temp_max    = temperature + 3.0
-        pressure    = data['pressure']
-        humidity    = min(100, data['humidity'] + day_offset * 0.5)
-        wind_speed  = data['wind_speed']
-        wind_deg    = data.get('wind_deg', 0)
-        clouds      = data.get('clouds', 0)
+        pm2_5 = data['pm2_5']
+        pm10  = data['pm10']
+        no2   = data['no2']
+        o3    = data['o3']
+        so2   = data['so2']
+        co    = data['co']
 
-    temp_range = temp_max - temp_min
+    temp_trend     = day_offset * 0.3
+    humidity_trend = day_offset * 0.5
+    
+    temperature = data['temperature'] + temp_trend
+    feels_like  = temperature - 2.0
+    temp_min    = temperature - 3.0
+    temp_max    = temperature + 3.0
+    temp_range  = temp_max - temp_min
+    humidity    = min(100, data['humidity'] + humidity_trend)
+    
+    hour_sin = np.sin(2 * np.pi * hour / 24)
+    hour_cos = np.cos(2 * np.pi * hour / 24)
+    pm_ratio = pm2_5 / pm10 if pm10 > 0 else 0.0
 
+    # Dictionary with ALL features generated by backfill script
     row = {
-        'hour':             hour,
-        'day':              day,
-        'month':            month,
-        'day_of_week':      day_of_week,
-        'is_weekend':       is_weekend,
-        'season':           season,
-        'pm2_5':            pm2_5,
-        'pm10':             pm10,
-        'no2':              no2,
-        'o3':               o3,
-        'so2':              so2,
-        'co':               co,
-        'temperature':      temperature,
-        'feels_like':       feels_like,
-        'temp_min':         temp_min,
-        'temp_max':         temp_max,
-        'pressure':         pressure,
-        'humidity':         humidity,
-        'wind_speed':       wind_speed,
-        'wind_deg':         wind_deg,
-        'clouds':           clouds,
-        'pm_ratio':         pm_ratio,
-        'temp_range':       temp_range,
-        'is_rush_hour':     is_rush_hour,
-        'hour_sin':         hour_sin,
-        'hour_cos':         hour_cos,
-        'aqi_change_rate':  aqi_change_rate,
+        'hour':        hour,
+        'day':         day,
+        'month':       month,
+        'day_of_week': day_of_week,
+        'season':      season,
+        'is_weekend':  is_weekend,
+        'is_rush_hour': is_rush_hour,
+        'pm2_5':       pm2_5,
+        'pm10':        pm10,
+        'no2':         no2,
+        'so2':         so2,
+        'o3':          o3,
+        'co':          co,
+        'pm_ratio':    pm_ratio,
+        'temperature': temperature,
+        'feels_like':  feels_like,
+        'temp_min':    temp_min,
+        'temp_max':    temp_max,
+        'temp_range':  temp_range,
+        'pressure':    data['pressure'],
+        'humidity':    humidity,
+        'wind_speed':  data['wind_speed'],
+        'wind_deg':    0.0,
+        'clouds':      0.0,
+        'hour_sin':    hour_sin,
+        'hour_cos':    hour_cos,
     }
-
+    
     df = pd.DataFrame([row])
-
-    # Align columns exactly to what the model was trained on
-    if feature_names:
-        for col in feature_names:
-            if col not in df.columns:
-                df[col] = 0.0
-        df = df[feature_names]
-
-    return df, pm2_5
+    
+    # --- CRITICAL FIX: Force Exact Column Order ---
+    expected_cols = [
+        "hour", "day", "month", "day_of_week", "season", "is_weekend", "is_rush_hour",
+        "pm2_5", "pm10", "no2", "so2", "o3", "co", "pm_ratio",
+        "temperature", "feels_like", "temp_min", "temp_max", "temp_range",
+        "pressure", "humidity", "wind_speed", "wind_deg", "clouds",
+        "hour_sin", "hour_cos"
+    ]
+    
+    # Reorder columns to exactly match what the model trained on
+    df = df[expected_cols]
+    return df
 
 
 def predict_with_model(model_obj, feature_df):
@@ -269,32 +192,42 @@ def predict_with_model(model_obj, feature_df):
 
 
 def make_forecast(data, model_obj, days=3):
-    """
-    Autoregressive 3-day forecast: model predicts PM2.5, converted to US AQI.
-    Each day's predicted PM2.5 feeds into the next day's feature row.
-    """
     preds = []
-    prev_pm25 = data['pm2_5']
+    forecast_list = data.get('forecast_list', [])
+    
+    if not forecast_list:
+        st.warning("⚠️ API Warning: No forecast data received! Using current weather for all days.")
 
     for i in range(1, days + 1):
-        feature_df, projected_pm25 = build_feature_row(data, day_offset=i, prev_pm25=prev_pm25)
+        idx = min((i * 24) - 1, len(forecast_list) - 1)
+        overrides = None
+        
+        if forecast_list and idx >= 0:
+            forecast_item = forecast_list[idx]
+            components = forecast_item['components']
+            overrides = {
+                'pm2_5': components.get('pm2_5', 0),
+                'pm10':  components.get('pm10', 0),
+                'no2':   components.get('no2', 0),
+                'o3':    components.get('o3', 0),
+                'so2':   components.get('so2', 0),
+                'co':    components.get('co', 0),
+            }
+
+        feature_df = build_feature_row(data, day_offset=i, pollutant_overrides=overrides)
+        
         try:
-            predicted_pm25 = predict_with_model(model_obj, feature_df)
-            predicted_pm25 = max(0.0, predicted_pm25)
-            predicted_aqi  = pm25_to_us_aqi(predicted_pm25)
+            predicted_aqi = predict_with_model(model_obj, feature_df)
+            predicted_aqi = round(max(0.0, min(500.0, predicted_aqi)), 1)
         except Exception as e:
-            st.warning(f"Prediction error on day {i}: {e}")
-            predicted_pm25 = projected_pm25
-            predicted_aqi  = pm25_to_us_aqi(projected_pm25)
-
-        prev_pm25 = predicted_pm25   # chain predictions
-
+            # --- SHOW THE EXACT ERROR ON SCREEN INSTEAD OF FAILING SILENTLY ---
+            st.error(f"❌ CRASH ON DAY {i}: {e}")
+            predicted_aqi = data["aqi"] * 50  # Fallback just to show something
+            
         preds.append({
-            'date':  datetime.now() + timedelta(days=i),
-            'aqi':   predicted_aqi,
-            'pm2_5': round(predicted_pm25, 1),
+            'date': datetime.now() + timedelta(days=i),
+            'aqi':  predicted_aqi
         })
-
     return preds
 
 
@@ -310,13 +243,15 @@ def main():
 
         if models:
             best_model_file = MODEL_DIR / "best_model.txt"
+
             if best_model_file.exists():
                 with open(best_model_file, "r") as f:
                     best_model_name = f.read().strip()
-                model_choice = best_model_name if best_model_name in models else list(models.keys())[0]
                 if best_model_name in models:
+                    model_choice = best_model_name
                     st.success(f"🏆 Best Model Auto-Selected: {model_choice}")
                 else:
+                    model_choice = list(models.keys())[0]
                     st.warning("Best model not found — using first available.")
             else:
                 model_choice = list(models.keys())[0]
@@ -333,6 +268,7 @@ def main():
         st.markdown("### 📍 Location")
         st.write(f"**City:** {CITY_NAME}")
         st.write(f"**Lat:** {KARACHI_LAT} | **Lon:** {KARACHI_LON}")
+
         st.markdown("---")
         st.markdown("### 🔬 Models")
         st.write("1️⃣ Random Forest")
@@ -352,37 +288,38 @@ def main():
 
     st.header("📊 Current Air Quality")
 
-    current_us_aqi = pm25_to_us_aqi(data['pm2_5'])
-    cat, color, emoji = get_aqi_category(current_us_aqi)
+    aqi_raw     = data['aqi']
+    aqi_display = round(aqi_raw * 50, 1)
+    cat, color, emoji = get_aqi_category(aqi_display)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("US AQI",      f"{current_us_aqi:.0f}")
-    c2.metric("PM2.5",       f"{data['pm2_5']:.1f} μg/m³")
-    c3.metric("Temperature", f"{data['temperature']:.1f}°C")
-    c4.metric("Humidity",    f"{data['humidity']:.0f}%")
+    c1.metric("AQI Index",    aqi_raw)
+    c2.metric("PM2.5",        f"{data['pm2_5']:.1f} μg/m³")
+    c3.metric("Temperature",  f"{data['temperature']:.1f}°C")
+    c4.metric("Humidity",     f"{data['humidity']:.0f}%")
 
     st.markdown(f"""
     <div style='padding:1rem; background:{color}; color:black; border-radius:8px; margin:1rem 0;'>
         <h3>{emoji} Air Quality: {cat}</h3>
-        <p>Current AQI for Karachi is {current_us_aqi:.0f} — {cat}</p>
+        <p>Current AQI for Karachi is {aqi_raw} — {cat}</p>
     </div>""", unsafe_allow_html=True)
 
     st.markdown("---")
+
     st.header("📅 3-Day AQI Forecast")
 
     if model_choice and models:
-        st.info(f"🤖 Predictions by: **{model_choice}** (predicts PM2.5 → converts to US AQI)")
+        st.info(f"🤖 Predictions generated by: **{model_choice}**")
         preds = make_forecast(data, models[model_choice])
     else:
         st.warning("No model available for forecast.")
         return
 
-    cols = st.columns(3)
+    cols  = st.columns(3)
     for i, pred in enumerate(preds):
         with cols[i]:
             st.subheader(pred['date'].strftime("%A"))
-            st.metric(pred['date'].strftime("%b %d"), f"AQI {pred['aqi']:.0f}")
-            st.caption(f"PM2.5: {pred['pm2_5']} μg/m³")
+            st.metric(pred['date'].strftime("%b %d"), f"AQI {pred['aqi']}")
             cat2, _, em2 = get_aqi_category(pred["aqi"])
             st.markdown(f"{em2} **{cat2}**")
 
@@ -390,7 +327,7 @@ def main():
     st.subheader("📈 AQI Trend")
 
     dates  = ['Today'] + [p['date'].strftime("%a") for p in preds]
-    values = [current_us_aqi] + [p['aqi'] for p in preds]
+    values = [aqi_display] + [p['aqi'] for p in preds]
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -428,11 +365,11 @@ def main():
     st.markdown("---")
     st.header("💡 Health Recommendations")
 
-    if   current_us_aqi <= 50:  st.success("✅ Air quality is GOOD. Enjoy outdoor activities!")
-    elif current_us_aqi <= 100: st.info("ℹ️ MODERATE. Sensitive people should be cautious.")
-    elif current_us_aqi <= 150: st.warning("⚠️ UNHEALTHY for sensitive groups. Reduce outdoor activity.")
-    elif current_us_aqi <= 200: st.error("🚨 UNHEALTHY. Everyone should limit outdoor exertion.")
-    else:                       st.error("☠️ HAZARDOUS! Avoid all outdoor activities!")
+    if   aqi_display <= 50:  st.success("✅ Air quality is GOOD. Enjoy outdoor activities!")
+    elif aqi_display <= 100: st.info("ℹ️ MODERATE. Sensitive people should be cautious.")
+    elif aqi_display <= 150: st.warning("⚠️ UNHEALTHY for sensitive groups. Reduce outdoor activity.")
+    elif aqi_display <= 200: st.error("🚨 UNHEALTHY. Everyone should limit outdoor exertion.")
+    else:                    st.error("☠️ HAZARDOUS! Avoid all outdoor activities!")
 
     st.markdown("---")
     st.markdown("""
